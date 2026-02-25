@@ -47,18 +47,26 @@ func (h *SidecarHandler) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		statusCode = http.StatusInternalServerError
 		w.WriteHeader(statusCode)
-		w.Write([]byte("Some errors occurred while creating container. Check Docker Sidecar's logs"))
+		w.Write([]byte("Some errors occurred while deleting container. Check Docker Sidecar's logs"))
 		log.G(h.Ctx).Error(err)
 		return
 	}
 
 	podUID := string(pod.UID)
 	podNamespace := string(pod.Namespace)
+	if podUID == "" || podNamespace == "" {
+		statusCode = http.StatusUnprocessableEntity
+		log.G(h.Ctx).Info("\u274C [DELETE CALL] validation error: pod.uid and pod.namespace are required")
+		http.Error(w, "validation error: pod.uid and pod.namespace are required", statusCode)
+		commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
+		span.End()
+		return
+	}
 
 	for _, container := range pod.Spec.Containers {
 		containerName := podNamespace + "-" + podUID + "-" + container.Name
 		// if the FPGA manager is nil we don't need to release the container
-		if h.FPGAManager != nil {
+		if !isNilInterface(h.FPGAManager) {
 			// release the container from the FPGA manager
 			err = h.FPGAManager.Release(containerName)
 			if err != nil {
@@ -85,34 +93,38 @@ func (h *SidecarHandler) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Deleted container " + podUID + "_dind")
 	}
 
-	dindSpec := dindmanager.DindSpecs{}
-	dindSpec, err = h.DindManager.GetDindFromPodUID(podUID)
-
-	if err != nil {
-		log.G(h.Ctx).Error("\u274C [DELETE CALL] Error retrieving DindSpecs, maybe the Dind container has already been deleted")
+	if isNilInterface(h.DindManager) {
+		log.G(h.Ctx).Error("\u274C [DELETE CALL] DindManager is nil; skipping DIND network cleanup")
 	} else {
-		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+		dindSpec := dindmanager.DindSpecs{}
+		dindSpec, err = h.DindManager.GetDindFromPodUID(podUID)
 
-		// log the retrieved dindSpec
-		log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
-
-		cmd = []string{"network", "rm", dindSpec.DindNetworkID}
-		shell = exec.ExecTask{
-			Command: "docker",
-			Args:    cmd,
-			Shell:   true,
-		}
-		execReturn, _ = shell.Execute()
-		execReturn.Stdout = strings.ReplaceAll(execReturn.Stdout, "\n", "")
-		if execReturn.Stderr != "" {
-			log.G(h.Ctx).Error("\u274C [DELETE CALL] Error deleting network " + dindSpec.DindNetworkID)
-		} else {
-			log.G(h.Ctx).Info("\u2705 [DELETE CALL] Deleted network " + dindSpec.DindNetworkID)
-		}
-		// set the dind available again
-		err = h.DindManager.RemoveDindFromList(dindSpec.PodUID)
 		if err != nil {
-			log.G(h.Ctx).Error("\u274C [DELETE CALL] Error setting DIND container available")
+			log.G(h.Ctx).Error("\u274C [DELETE CALL] Error retrieving DindSpecs, maybe the Dind container has already been deleted")
+		} else {
+			log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+
+			// log the retrieved dindSpec
+			log.G(h.Ctx).Info("\u2705 [DELETE CALL] Retrieved DindSpecs: " + dindSpec.DindID + " " + dindSpec.PodUID + " " + dindSpec.DindNetworkID + " ")
+
+			cmd = []string{"network", "rm", dindSpec.DindNetworkID}
+			shell = exec.ExecTask{
+				Command: "docker",
+				Args:    cmd,
+				Shell:   true,
+			}
+			execReturn, _ = shell.Execute()
+			execReturn.Stdout = strings.ReplaceAll(execReturn.Stdout, "\n", "")
+			if execReturn.Stderr != "" {
+				log.G(h.Ctx).Error("\u274C [DELETE CALL] Error deleting network " + dindSpec.DindNetworkID)
+			} else {
+				log.G(h.Ctx).Info("\u2705 [DELETE CALL] Deleted network " + dindSpec.DindNetworkID)
+			}
+			// set the dind available again
+			err = h.DindManager.RemoveDindFromList(dindSpec.PodUID)
+			if err != nil {
+				log.G(h.Ctx).Error("\u274C [DELETE CALL] Error setting DIND container available")
+			}
 		}
 	}
 	wd, err := os.Getwd()

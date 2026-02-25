@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,93 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	trace "go.opentelemetry.io/otel/trace"
 )
+
+type httpRequestError struct {
+	Status  int
+	Message string
+	Err     error
+}
+
+func (e *httpRequestError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Err)
+	}
+	return e.Message
+}
+
+func (e *httpRequestError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func parseCreateRequestBody(bodyBytes []byte) ([]commonIL.RetrievedPodData, error) {
+	trimmed := bytes.TrimSpace(bodyBytes)
+	if len(trimmed) == 0 {
+		return nil, &httpRequestError{Status: http.StatusBadRequest, Message: "empty request body"}
+	}
+
+	validate := func(req []commonIL.RetrievedPodData) error {
+		for i, item := range req {
+			if string(item.Pod.UID) == "" {
+				return &httpRequestError{Status: http.StatusUnprocessableEntity, Message: fmt.Sprintf("validation error: pod.uid is required (index %d)", i)}
+			}
+			if item.Pod.Namespace == "" {
+				return &httpRequestError{Status: http.StatusUnprocessableEntity, Message: fmt.Sprintf("validation error: pod.namespace is required (index %d)", i)}
+			}
+		}
+		return nil
+	}
+
+	switch trimmed[0] {
+	case '[':
+		var req []commonIL.RetrievedPodData
+		arrErr := json.Unmarshal(trimmed, &req)
+		if arrErr == nil {
+			if len(req) == 0 {
+				return nil, &httpRequestError{Status: http.StatusUnprocessableEntity, Message: "request body array is empty"}
+			}
+			if err := validate(req); err != nil {
+				return nil, err
+			}
+			return req, nil
+		}
+
+		// Be tolerant of an extra nesting level (e.g. [[{...}]])
+		var nested [][]commonIL.RetrievedPodData
+		if err := json.Unmarshal(trimmed, &nested); err == nil {
+			flat := make([]commonIL.RetrievedPodData, 0)
+			for _, inner := range nested {
+				flat = append(flat, inner...)
+			}
+			if len(flat) == 0 {
+				return nil, &httpRequestError{Status: http.StatusUnprocessableEntity, Message: "request body array is empty"}
+			}
+			if err := validate(flat); err != nil {
+				return nil, err
+			}
+			return flat, nil
+		}
+
+		return nil, &httpRequestError{Status: http.StatusBadRequest, Message: "invalid JSON: expected an array of RetrievedPodData", Err: arrErr}
+	case '{':
+		var single commonIL.RetrievedPodData
+		if err := json.Unmarshal(trimmed, &single); err != nil {
+			return nil, &httpRequestError{Status: http.StatusBadRequest, Message: "invalid JSON: expected a RetrievedPodData object", Err: err}
+		}
+		req := []commonIL.RetrievedPodData{single}
+		if err := validate(req); err != nil {
+			return nil, err
+		}
+		return req, nil
+	default:
+		return nil, &httpRequestError{Status: http.StatusBadRequest, Message: "invalid JSON: expected object or array"}
+	}
+}
 
 func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w http.ResponseWriter) ([]DockerRunStruct, error) {
 
@@ -93,7 +181,7 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is not requesting a FPGA")
 				} else {
 
-					if h.FPGAManager == nil {
+					if isNilInterface(h.FPGAManager) {
 						log.G(h.Ctx).Error("\u274C [CREATE CALL] FPGA Manager is not initialized")
 						HandleErrorAndRemoveData(h, w, "FPGA Manager is not initialized", errors.New("FPGA Manager is not initialized"), podNamespace, podUID)
 						return dockerRunStructs, errors.New("FPGA Manager is not initialized")
@@ -301,6 +389,32 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 	// create bool variable to set if a new dind container has to be created
 	newDindContainerCreated := false
 
+	statusCode := http.StatusOK
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		HandleErrorAndRemoveData(h, w, "An error occurred during read of body request for pod creation", err, "", "")
+		return
+	}
+
+	req, err := parseCreateRequestBody(bodyBytes)
+	if err != nil {
+		var hre *httpRequestError
+		if errors.As(err, &hre) {
+			statusCode = hre.Status
+			log.G(h.Ctx).Error(err)
+			log.G(h.Ctx).Info("\u274C Error description: " + hre.Message)
+			http.Error(w, hre.Message, statusCode)
+			span.SetAttributes(attribute.String("error", err.Error()))
+			commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
+			span.End()
+			return
+		}
+
+		HandleErrorAndRemoveData(h, w, "An error occurred during json unmarshal of data from pod creation request", err, "", "")
+		return
+	}
+
 	// get a dind container ID from dind manager of the sidecard handler
 	dindContainerID, err := h.DindManager.GetAvailableDind()
 	if err != nil {
@@ -328,23 +442,6 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		go h.DindManager.BuildDindContainers(1)
 	}
 
-	//var execReturn exec.ExecResult
-	statusCode := http.StatusOK
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		HandleErrorAndRemoveData(h, w, "An error occurred during read of body request for pod creation", err, "", "")
-		return
-	}
-
-	var req []commonIL.RetrievedPodData
-	err = json.Unmarshal(bodyBytes, &req)
-
-	if err != nil {
-		HandleErrorAndRemoveData(h, w, "An error occurred during json unmarshal of data from pod creation request", err, "", "")
-		return
-	}
-
 	wd, err := os.Getwd()
 	if err != nil {
 		HandleErrorAndRemoveData(h, w, "Unable to get current working directory", err, "", "")
@@ -357,6 +454,11 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 
 		podUID := string(data.Pod.UID)
 		podNamespace := string(data.Pod.Namespace)
+
+		// Ensure the DIND can be located for cleanup even if an early error happens.
+		if podUID != "" {
+			_ = h.DindManager.SetPodUIDToDind(dindContainerID, podUID)
+		}
 
 		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
 
@@ -400,7 +502,7 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// set the podUID to the dind container
+		// set the podUID to the dind container (already attempted earlier)
 		err = h.DindManager.SetPodUIDToDind(dindContainerID, podUID)
 		if err != nil {
 			HandleErrorAndRemoveData(h, w, "An error occurred during the setting of the pod UID to the DIND container", err, "", "")
